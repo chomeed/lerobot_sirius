@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-sirius"
+version = "0.1.0"
+description = "SIRIUS-style intervention-weighted dataset and training for LeRobot"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot>0.5.2",
+]
+
+[project.scripts]
+lerobot-sirius-train = "lerobot_sirius.lerobot_sirius_train:main"
+
+[tool.setuptools]
+# repo root is the package: dataset.py -> lerobot_sirius.dataset, etc.
+packages = ["lerobot_sirius"]
+package-dir = {"lerobot_sirius" = "."}
