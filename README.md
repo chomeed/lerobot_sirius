@@ -5,7 +5,18 @@ SIRIUS-style intervention-weighted dataset and training for LeRobot.
 `SIRIUSDataset` labels every frame as `demo` / `intv` / `preintv` / `robot` and samples
 batches with a per-class ratio (P*(intv) = 0.5 fixed, P*(demo) = empirical P(demo),
 P*(preintv) = 0, P*(robot) = the remainder). Datasets without an `intervention`
-feature are treated as demos. Normalization stats come from the demo dataset.
+feature are treated as demos. Normalization stats are recomputed from scratch and
+merged over all datasets by default.
+
+Sampling ratio on our board-insertion datasets (`board_insertion_ablation_head` +
+`board_insertion_ablation_dagger`, 97,281 frames):
+
+| class | frames | P(c) | sampling ratio P*(c) |
+|---|---:|---:|---:|
+| demo | 44,051 | 0.4528 | 0.4528 |
+| intv | 12,895 | 0.1326 | 0.5000 |
+| preintv | 2,697 | 0.0277 | 0.0000 |
+| robot | 37,638 | 0.3869 | 0.0472 |
 
 ## Install
 
