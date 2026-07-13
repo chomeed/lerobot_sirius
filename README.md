@@ -47,6 +47,48 @@ accelerate launch --num_processes=3 --multi_gpu $(which lerobot-sirius-train) \
     --optimizer.lr=2.5e-5
 ```
 
+### Train from a base-trained policy
+
+`--policy.pretrained_path` doesn't have to be a foundation model like
+`lerobot/pi05_base` — it can point at a policy already fine-tuned on the demo
+data (base-trained). SIRIUS training then continues from those weights while
+sampling demo + intervention frames per the class ratios, which is the usual
+SIRIUS setup: base-train on demos first, then refine with interventions.
+
+```bash
+accelerate launch --num_processes=3 --multi_gpu $(which lerobot-sirius-train) \
+    --policy.type=pi05 \
+    --policy.repo_id=chomeed/board_insertion_ablation_sirius_pi05 \
+    --policy.dtype=bfloat16 \
+    --policy.n_action_steps=30 \
+    --policy.chunk_size=30 \
+    --policy.pretrained_path=chomeed/board_insertion_ablation_head_pi05_delta_recomputed_stats_25k \
+    --policy.gradient_checkpointing=true \
+    --policy.use_relative_actions=true \
+    --policy.relative_exclude_joints='["gripper_left"]' \
+    --dataset.repo_id="chomeed/board_insertion_ablation_head,chomeed/board_insertion_ablation_dagger" \
+    --sirius.p_intv=0.5 \
+    --output_dir=outputs/train/board_insertion_ablation_sirius_pi05 \
+    --job_name=board_insertion_ablation_sirius_pi05 \
+    --wandb.enable=true \
+    --wandb.disable_artifact=true \
+    --wandb.project=grant-hyundai \
+    --steps=50_000 \
+    --batch_size=16 \
+    --num_workers=16 \
+    --save_freq=10_000 \
+    --log_freq=200 \
+    --policy.scheduler_warmup_steps=1_000 \
+    --policy.scheduler_decay_steps=50_000 \
+    --policy.scheduler_decay_lr=1.0e-6 \
+    --optimizer.lr=1.0e-5
+```
+
+Compared to training from `pi05_base`: fewer steps (50k), a shorter warmup, and
+a 2.5x lower learning rate, since the policy already knows the task. Note the
+normalization stats are still the merged recomputed stats from the current
+datasets, not the checkpoint's (unless `--sirius.use_recomputed_stats=false`).
+
 - `--dataset.repo_id` is comma-separated: demo repo(s) + dagger repo(s) with an
   `intervention` feature.
 - Each entry may carry its own local path as `repo_id@/local/path`, mixed freely
