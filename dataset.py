@@ -62,17 +62,16 @@ METHOD
 '''
 
 import logging
-import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from lerobot.datasets.compute_stats import aggregate_stats
-from lerobot.datasets.dataset_tools import recompute_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+from .pooled_stats import compute_pooled_stats
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +96,9 @@ class SIRIUSDataset(MultiLeRobotDataset):
         p_intv: float = 0.5,
         p_demo: float | None = None,
         p_preintv: float = 0.0,
-        preintv_seconds: float = 1.0,
-        use_recomputed_stats: bool = True,
+        preintv_seconds: float = 3.0,
+        p_robot_max: float = 0.10,
+        use_recomputed_stats: bool = False,
         stats_chunk_size: int = 30,
         stats_relative_exclude_joints: list[str] | None = None,
         roots: dict[str, str | Path] | None = None,
@@ -155,30 +155,49 @@ class SIRIUSDataset(MultiLeRobotDataset):
                 self.disabled_features.update(extra_keys)
 
         self.delta_timestamps = delta_timestamps
-        # `self.stats` merges all datasets' stats (count-weighted), so it equals the
-        # stats of the concatenated dataset. With use_recomputed_stats, each dataset's
-        # numeric stats are first recomputed from scratch (rewrites its stats.json;
-        # image/video stats are kept). Only rank 0 recomputes: in distributed training
-        # the other ranks are constructed after a barrier and read the fresh stats.json.
-        # Action stats are always recomputed in relative space; chunk_size and
-        # exclude_joints must match the policy's relative-action settings so the
-        # stats match the normalization distribution seen in training.
+        # With use_recomputed_stats, quantiles are pooled over every frame of every
+        # dataset in one pass (see pooled_stats). Aggregating per-dataset (or per-episode)
+        # quantiles would average them, which does not yield the quantile of the union:
+        # it collapses the q01..q99 span to a fraction of its true width.
+        # Action stats are pooled in relative space; chunk_size and exclude_joints must
+        # match the policy's relative-action settings so the stats describe the same
+        # distribution the model is normalized against.
+        # Every rank computes this identically from raw data (~10s), so no stats.json is
+        # written and no rank-0 barrier is needed.
         if stats_relative_exclude_joints is None:
             stats_relative_exclude_joints = ["gripper_left"]
-        if use_recomputed_stats and int(os.environ.get("RANK", 0)) == 0:
-            for ds in self._datasets:
-                recompute_stats(
-                    ds,
-                    relative_action=True,
-                    relative_exclude_joints=stats_relative_exclude_joints,
-                    chunk_size=stats_chunk_size,
+        if use_recomputed_stats:
+            self.stats = compute_pooled_stats(
+                self._datasets,
+                relative_action=True,
+                relative_exclude_joints=stats_relative_exclude_joints,
+                chunk_size=stats_chunk_size,
+            )
+        else:
+            # Freeze normalization to the demo dataset's stats.json, so a policy warm-started
+            # from a demo-only checkpoint keeps the normalized space it was trained in.
+            # NOT aggregate_stats() over all datasets: that averages the per-dataset quantiles,
+            # and the mean of two quantiles is not the quantile of their union. This matches
+            # what make_sirius_dataset() actually normalizes with (it exposes the demo
+            # dataset's meta as `dataset.meta` and leaves its stats untouched in this branch).
+            demos = [d for d in self._datasets if "intervention" not in d.features]
+            if len(demos) != 1:
+                raise ValueError(
+                    f"use_recomputed_stats=False freezes normalization to *the* demo dataset, but "
+                    f"{len(demos)} of {repo_ids} have no 'intervention' feature: "
+                    f"{[d.repo_id for d in demos]}. With none there are no demo stats to freeze to; "
+                    f"with several, whose stats.json to use is ambiguous. Pass exactly one demo "
+                    f"repo_id, or use use_recomputed_stats=True to pool quantiles over all datasets."
                 )
-        self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
+            demo = demos[0]
+            logger.info(f"use_recomputed_stats=False: normalizing with stats of '{demo.repo_id}'")
+            self.stats = demo.meta.stats
         self.set_image_transforms(image_transforms)
 
         # ── SIRIUS postinit ───────────────────────────────────────────
         fps_per_dataset = {repo_id: ds.fps for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True)}
         assert len(set(fps_per_dataset.values())) == 1, f"all datasets must share the same fps, got {fps_per_dataset}"
+        self._p_robot_max = p_robot_max
         self.preintv_horizon = round(preintv_seconds * self._datasets[0].fps)
         self._label_frames()
         self._compute_sampling_probs(p_intv=p_intv, p_demo=p_demo, p_preintv=p_preintv)
@@ -193,8 +212,11 @@ class SIRIUSDataset(MultiLeRobotDataset):
         each False->True onset, robot for everything else.
         """
         labels = []
-        for ds in self._datasets:
+        owner = []  # index into self._datasets, per frame -- lets a curriculum phase select
+        # "demos + the first k dagger datasets" without reloading anything.
+        for ds_idx, ds in enumerate(self._datasets):
             n = ds.num_frames
+            owner.append(np.full(n, ds_idx, dtype=np.int64))
             if "intervention" not in ds.features:
                 labels.append(np.full(n, SIRIUS_CLASSES.index("demo"), dtype=np.int64))
                 continue
@@ -221,29 +243,65 @@ class SIRIUSDataset(MultiLeRobotDataset):
             labels.append(ds_labels)
 
         self.frame_labels = np.concatenate(labels)
+        self.frame_dataset_idx = np.concatenate(owner)
         self.class_indices = {
             c: np.flatnonzero(self.frame_labels == i) for i, c in enumerate(SIRIUS_CLASSES)
         }
         self.class_counts = {c: len(idx) for c, idx in self.class_indices.items()}
 
+        # Dagger datasets in the order they were passed in repo_ids. An accumulative curriculum
+        # phase k trains on the demos plus dagger_1..dagger_k, so this ordering is load-bearing.
+        self.dagger_dataset_indices = [
+            i for i, ds in enumerate(self._datasets) if "intervention" in ds.features
+        ]
+        self.demo_dataset_indices = [
+            i for i, ds in enumerate(self._datasets) if "intervention" not in ds.features
+        ]
+
+    def _resolve_probs(self, counts: dict[str, int], n_active: int) -> dict[str, float]:
+        """Class sampling ratios over a set of active frames.
+
+        P*(intv) and P*(preintv) are fixed by config. P*(robot) is what's left over -- but the
+        `robot` class is the autonomous rollout the policy was already failing at, and it grows
+        as dagger datasets accumulate (P(demo) shrinks), so it is capped at `p_robot_max`. The
+        surplus goes to the demos rather than to more of the robot's own mistakes.
+        """
+        p_intv, p_preintv, cap = self._p_intv, self._p_preintv, self._p_robot_max
+
+        p_demo = self._p_demo if self._p_demo is not None else counts["demo"] / n_active
+        p_robot = 1.0 - p_intv - p_demo - p_preintv
+        if p_robot < -1e-9:
+            raise ValueError(
+                f"p_intv + p_demo + p_preintv = {p_intv + p_demo + p_preintv:.4f} > 1"
+            )
+        p_robot = max(p_robot, 0.0)
+
+        capped = 0.0 if counts["robot"] == 0 else min(p_robot, cap)
+        p_demo += p_robot - capped  # demos absorb whatever the cap took off robot
+
+        return {"demo": p_demo, "intv": p_intv, "preintv": p_preintv, "robot": capped}
+
     def _compute_sampling_probs(self, p_intv: float, p_demo: float | None, p_preintv: float) -> None:
         n_total = self.num_frames
         empirical = {c: self.class_counts[c] / n_total for c in SIRIUS_CLASSES}
 
-        if p_demo is None:
-            p_demo = empirical["demo"]
-        p_robot = 1.0 - p_intv - p_demo - p_preintv
-        if p_robot < 0:
-            raise ValueError(
-                f"p_intv + p_demo + p_preintv = {p_intv + p_demo + p_preintv:.4f} > 1"
-            )
+        # Keep the *requested* p_demo (possibly None) so a curriculum round can re-derive the
+        # empirical fraction over its own subset, where P(demo) is larger.
+        self._p_intv, self._p_demo, self._p_preintv = p_intv, p_demo, p_preintv
 
         self.empirical_probs = empirical
-        self.sampling_probs = {"demo": p_demo, "intv": p_intv, "preintv": p_preintv, "robot": p_robot}
+        self.sampling_probs = self._resolve_probs(self.class_counts, n_total)
 
         for c, p in self.sampling_probs.items():
             if p > 0 and self.class_counts[c] == 0:
                 raise ValueError(f"sampling prob for '{c}' is {p:.4f} but the class has no frames")
+
+        if empirical["robot"] > self._p_robot_max:
+            logger.info(
+                f"P*(robot) capped at {self._p_robot_max:.0%} (empirical P(robot)="
+                f"{empirical['robot']:.1%}); surplus given to demos -> P*(demo)="
+                f"{self.sampling_probs['demo']:.1%}"
+            )
 
         # per-frame weights: weights of class c sum to P*(c), for WeightedRandomSampler
         weights = np.zeros(n_total, dtype=np.float64)
@@ -258,14 +316,66 @@ class SIRIUSDataset(MultiLeRobotDataset):
             for c in SIRIUS_CLASSES
         }
 
+    def phase_weights(self, n_daggers: int) -> torch.Tensor:
+        """Per-frame sampling weights for an accumulative curriculum phase.
+
+        Phase `n_daggers` trains on the demo datasets plus the first `n_daggers` dagger datasets
+        in `repo_ids` order; the rest get zero weight. n_daggers=0 is the demo-only warmup.
+        The class ratios (p_intv, p_demo, ...) are re-derived over the frames active in this
+        phase, since P(demo) grows as fewer daggers are mixed in.
+
+        Normalization stats are NOT touched: they are fixed at construction (with
+        use_recomputed_stats=False, to the demo dataset's) and must stay fixed across phases,
+        or each switch would silently rescale what the previous phase learned.
+        """
+        n_all = len(self.dagger_dataset_indices)
+        if not 0 <= n_daggers <= n_all:
+            raise ValueError(f"n_daggers must be in [0, {n_all}], got {n_daggers}")
+
+        active_ds = set(self.demo_dataset_indices) | set(self.dagger_dataset_indices[:n_daggers])
+        active = np.isin(self.frame_dataset_idx, list(active_ds))
+
+        counts = {c: int(((self.frame_labels == i) & active).sum()) for i, c in enumerate(SIRIUS_CLASSES)}
+        n_active = int(active.sum())
+        if n_active == 0:
+            raise ValueError(f"curriculum phase with n_daggers={n_daggers} selected no frames")
+
+        if n_daggers == 0:
+            probs = {"demo": 1.0, "intv": 0.0, "preintv": 0.0, "robot": 0.0}
+        else:
+            probs = self._resolve_probs(counts, n_active)
+
+        weights = np.zeros(self.num_frames, dtype=np.float64)
+        for i, c in enumerate(SIRIUS_CLASSES):
+            if probs[c] > 0:
+                if counts[c] == 0:
+                    raise ValueError(
+                        f"phase n_daggers={n_daggers}: sampling prob for '{c}' is {probs[c]:.4f} "
+                        f"but no active frame has that class"
+                    )
+                weights[(self.frame_labels == i) & active] = probs[c] / counts[c]
+
+        logger.info(
+            f"curriculum phase n_daggers={n_daggers}: {n_active} active frames, "
+            f"ratios { {c: round(p, 4) for c, p in probs.items()} }"
+        )
+        return torch.from_numpy(weights)
+
     # ── Sampling ──────────────────────────────────────────────────────
 
-    def make_sampler(self, num_samples: int | None = None, generator=None):
+    def make_sampler(self, num_samples: int | None = None, generator=None, n_daggers: int | None = None):
         """WeightedRandomSampler drawing frames according to the class sampling
         ratio. Pass to DataLoader(sampler=...) -- do NOT also use
-        sample_batch_indices (don't do both)."""
+        sample_batch_indices (don't do both).
+
+        n_daggers=None (default) draws from every dataset with the configured ratios.
+        n_daggers=k restricts an accumulative curriculum phase to the demos plus the first k
+        dagger datasets in `repo_ids` order (k=0 -> demo-only warmup).
+        """
+        weights = self.frame_weights if n_daggers is None else self.phase_weights(n_daggers)
+
         return torch.utils.data.WeightedRandomSampler(
-            self.frame_weights,
+            weights,
             num_samples=num_samples if num_samples is not None else self.num_frames,
             replacement=True,
             generator=generator,

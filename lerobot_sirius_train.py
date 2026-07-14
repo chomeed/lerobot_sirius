@@ -7,8 +7,10 @@
 #   --sirius.p_preintv, --sirius.preintv_seconds, --sirius.use_recomputed_stats).
 # - The dataset is a SIRIUSDataset built by make_sirius_dataset from a
 #   comma-separated --dataset.repo_id="demo_repo,dagger_repo". Normalization
-#   stats are recomputed from scratch and merged over all datasets by default
-#   (--sirius.use_recomputed_stats=false falls back to the demo dataset's stats).
+#   stats default to the demo dataset's (--sirius.use_recomputed_stats=false);
+#   =true pools quantiles over all datasets (fresh lineage only, never a warm start).
+# - --sirius.demo_only_steps runs an accumulative DAgger curriculum in one job:
+#   demos alone, then +dagger_1, then +dagger_2, each round to its own output dir.
 # - The EpisodeAwareSampler is replaced by the SIRIUS WeightedRandomSampler,
 #   which draws frames per class with probability P*(demo/intv/preintv/robot).
 #
@@ -20,6 +22,7 @@ import logging
 import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -127,6 +130,109 @@ def update_policy(
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     return train_metrics, output_dict
+
+
+def _is_task_trained_checkpoint(pretrained_path: str | Path | None) -> bool | None:
+    """True if `pretrained_path` is the output of a LeRobot training run, rather than a foundation
+    model like `lerobot/pi05_base`.
+
+    A training run writes `train_config.json` next to the weights; foundation checkpoints don't.
+    Returns None when it can't be determined (offline, private repo, ...), so the caller can warn
+    rather than block.
+    """
+    if not pretrained_path:
+        return False
+
+    local = Path(pretrained_path)
+    if local.exists():
+        return (local / "train_config.json").exists()
+
+    try:
+        from huggingface_hub import file_exists
+
+        return file_exists(str(pretrained_path), "train_config.json")
+    except Exception:
+        return None
+
+
+def build_phase_schedule(
+    cfg: SiriusTrainPipelineConfig, dataset
+) -> list[tuple[int, int, int | None, Path, str | None]]:
+    """Rounds of the curriculum: (start_step, end_step, n_daggers, output_dir, hub_repo_id).
+
+    Round 0 trains on the demos alone and keeps `cfg.output_dir`; round k adds the k-th dagger
+    dataset (in `--dataset.repo_id` order) and writes to a sibling `<output_dir>_sirius_round{k}`,
+    so each round's checkpoints are separately evaluable. Every round runs for the same number of
+    steps. n_daggers=None means "no curriculum": one phase over every dataset.
+    """
+    base = Path(cfg.output_dir)
+    n_daggers = len(dataset.dagger_dataset_indices)
+    warmup = cfg.sirius.demo_only_steps
+
+    if warmup == 0:
+        return [(0, cfg.steps, None, base, cfg.policy.repo_id)]
+
+    if n_daggers == 0:
+        raise ValueError(
+            "sirius.demo_only_steps > 0 starts a DAgger curriculum, but none of "
+            f"{dataset.repo_ids} has an 'intervention' feature, so there is no dagger round to "
+            "advance to. Pass --dataset.repo_id=demo,dagger_1[,dagger_2...] or set demo_only_steps=0."
+        )
+
+    # The curriculum trains a fresh lineage: round 0 IS the demo training. Starting it from a
+    # policy that was already fine-tuned on the task makes round 0 redundant, and re-running demo
+    # training on top of a converged checkpoint is not what anyone means by this flag.
+    pretrained = getattr(cfg.policy, "pretrained_path", None)
+    task_trained = _is_task_trained_checkpoint(pretrained)
+    if task_trained:
+        raise ValueError(
+            f"--sirius.demo_only_steps={warmup} runs the accumulative DAgger curriculum, whose "
+            f"round 0 IS the demo-only training -- so it must start from foundation weights "
+            f"(e.g. --policy.pretrained_path=lerobot/pi05_base).\n"
+            f"But '{pretrained}' ships a train_config.json, i.e. it is already a task-trained "
+            f"LeRobot checkpoint, which makes round 0 redundant.\n"
+            f"Either drop --sirius.demo_only_steps to warm-start from that checkpoint (single "
+            f"phase, demo stats frozen), or point --policy.pretrained_path at a base model to run "
+            f"the curriculum."
+        )
+    if task_trained is None:
+        logging.warning(
+            f"Could not tell whether '{pretrained}' is a foundation model or an already "
+            f"task-trained checkpoint; running the curriculum anyway. Round 0 (demo-only) is "
+            f"redundant if it is the latter."
+        )
+
+    per_round = cfg.sirius.dagger_round_steps
+    if per_round is None:
+        remaining = cfg.steps - warmup
+        if remaining <= 0 or remaining % n_daggers != 0:
+            raise ValueError(
+                f"cannot split the {remaining} steps after demo_only_steps={warmup} evenly across "
+                f"{n_daggers} dagger round(s). Set --sirius.dagger_round_steps explicitly, or pick "
+                f"--steps so that (steps - demo_only_steps) is a positive multiple of {n_daggers}."
+            )
+        per_round = remaining // n_daggers
+
+    total = warmup + per_round * n_daggers
+    if total != cfg.steps:
+        raise ValueError(
+            f"curriculum requires steps == demo_only_steps + dagger_round_steps * n_daggers = "
+            f"{warmup} + {per_round}*{n_daggers} = {total}, but --steps={cfg.steps}."
+        )
+
+    repo = cfg.policy.repo_id
+    phases = [(0, warmup, 0, base, repo)]
+    start = warmup
+    for k in range(1, n_daggers + 1):
+        phases.append((
+            start,
+            start + per_round,
+            k,
+            base.parent / f"{base.name}_sirius_round{k}",
+            f"{repo}_sirius_round{k}" if repo else None,
+        ))
+        start += per_round
+    return phases
 
 
 @parser.wrap()
@@ -347,27 +453,67 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
     # (frames near episode ends rely on delta_timestamps padding instead of
     # drop_n_last_frames).
     shuffle = False
-    sampler_generator = torch.Generator()
-    sampler_generator.manual_seed(cfg.seed if cfg.seed is not None else 0)
-    sampler = dataset.make_sampler(generator=sampler_generator)
     if cfg.resume and step > 0 and is_main_process:
         logging.warning(
             "SIRIUS weighted sampling is stateless: resuming restarts the sample order from the seed."
         )
 
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        collate_fn=collate_fn,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-    )
+
+    def build_dataloader(n_daggers: int | None) -> torch.utils.data.DataLoader:
+        """DataLoader for one curriculum phase (see `phases`).
+
+        Every phase indexes the same dataset object, so the normalization stats are identical
+        across a switch -- only which frames get drawn changes.
+        """
+        sampler_generator = torch.Generator()
+        # Distinct seed per phase, so a later phase doesn't replay an earlier one's draws.
+        base_seed = cfg.seed if cfg.seed is not None else 0
+        sampler_generator.manual_seed(base_seed + (0 if n_daggers is None else n_daggers + 1))
+        return torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=shuffle,
+            sampler=dataset.make_sampler(generator=sampler_generator, n_daggers=n_daggers),
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=collate_fn,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
+
+    def build_round_lr_scheduler(round_len: int):
+        """Fresh warmup -> cosine decay spanning exactly one curriculum round.
+
+        Built on the already-prepared optimizer, whose param_groups still carry `initial_lr` from
+        the first scheduler, so the new curve starts from the configured peak LR again. Weights and
+        optimizer state are untouched -- only the LR schedule restarts.
+        """
+        if cfg.scheduler is None:
+            return None
+        sched_cfg = cfg.scheduler
+        if hasattr(sched_cfg, "num_decay_steps"):
+            # decay over this round, not over cfg.steps, and keep the warmup at full length
+            sched_cfg = dataclasses.replace(sched_cfg, num_decay_steps=round_len)
+        return accelerator.prepare(sched_cfg.build(optimizer, round_len))
+
+    phases = build_phase_schedule(cfg, dataset)
+    # Nothing to restart if the policy has no LR schedule at all (e.g. ACT), so don't claim to.
+    per_round_lr = cfg.sirius.per_round_lr_schedule and len(phases) > 1 and cfg.scheduler is not None
+    if is_main_process and len(phases) > 1:
+        logging.info("SIRIUS accumulative curriculum (normalization stats fixed across all rounds):")
+        for start, end, n_dag, out, repo in phases:
+            using = "demos only" if n_dag == 0 else f"demos + dagger 1..{n_dag}"
+            logging.info(f"  steps {start:>7}..{end:<7} {using:<26} -> {out}  (hub: {repo})")
+
+    def phase_at(s: int):
+        return next((ph for ph in phases if ph[0] <= s < ph[1]), phases[-1])
+
+    current_phase = phase_at(step)
+    output_dir = current_phase[3]
+    phase_repo_id = current_phase[4]
+    dataloader = build_dataloader(n_daggers=current_phase[2])
 
     eval_dataloader = None  # SIRIUS: no eval split
 
@@ -378,6 +524,17 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
 
     if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
         load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
+
+    # Round 0 gets its own warmup -> cosine too, spanning the round rather than all of cfg.steps.
+    # (make_optimizer_and_scheduler built the scheduler over cfg.steps; replace it before any step.)
+    if per_round_lr and not cfg.resume:
+        lr_scheduler = build_round_lr_scheduler(current_phase[1] - current_phase[0])
+        if is_main_process:
+            logging.info(
+                f"Per-round LR schedule: each round restarts warmup -> cosine over its own "
+                f"{current_phase[1] - current_phase[0]} steps "
+                f"(--sirius.per_round_lr_schedule=false for one continuous schedule)"
+            )
 
     dl_iter = cycle(dataloader)
 
@@ -418,6 +575,28 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
         )
 
     for _ in range(step, cfg.steps):
+        # Curriculum round boundary: fold in the next dagger dataset. ONLY the sampler is
+        # rebuilt -- policy, optimizer, lr_scheduler (warmup + cosine decay over all cfg.steps)
+        # and the normalization stats all carry straight through. So a round changes the data
+        # distribution, not the space the policy lives in.
+        if step == current_phase[1] and step < cfg.steps:
+            current_phase = phase_at(step)
+            output_dir = current_phase[3]
+            phase_repo_id = current_phase[4]
+            n_dag = current_phase[2]
+            if is_main_process:
+                using = "demos only" if n_dag == 0 else f"demos + dagger 1..{n_dag}"
+                logging.info(f"step {step}: curriculum round -> {using}; checkpoints now in {output_dir}")
+            dataloader = accelerator.prepare_data_loader(build_dataloader(n_daggers=n_dag))
+            dl_iter = cycle(dataloader)
+            if per_round_lr:
+                lr_scheduler = build_round_lr_scheduler(current_phase[1] - current_phase[0])
+                if is_main_process:
+                    logging.info(
+                        f"step {step}: LR schedule restarted (warmup -> cosine) over this round's "
+                        f"{current_phase[1] - current_phase[0]} steps"
+                    )
+
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -442,7 +621,10 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_round_end = step == current_phase[1]
+        # Force a checkpoint at each round end even if it isn't a save_freq multiple, so every
+        # round's final policy is saved and pushed under its own repo id.
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps or is_round_end
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
 
         if is_log_step:
@@ -470,7 +652,8 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
                 model_state_dict, optim_state_dict = None, None
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                # Per-round dir: round 0 -> output_dir, round k -> <output_dir>_sirius_round{k}
+                checkpoint_dir = get_step_checkpoint_dir(output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -486,12 +669,11 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
                     optim_state_dict=optim_state_dict,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if cfg.save_checkpoint_to_hub:
-                    push_checkpoint_to_hub(
-                        checkpoint_dir,
-                        cfg.policy.repo_id,
-                        private=cfg.policy.private,
-                    )
+                if cfg.save_checkpoint_to_hub and phase_repo_id:
+                    # Round k pushes to <repo_id>_sirius_round{k}; the round-end checkpoint is
+                    # the last write, so each repo ends up holding that round's final policy.
+                    logging.info(f"Pushing step-{step} checkpoint to {phase_repo_id}")
+                    push_checkpoint_to_hub(checkpoint_dir, phase_repo_id, private=cfg.policy.private)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
@@ -510,7 +692,7 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                        videos_dir=output_dir / "eval" / f"videos_step_{step_id}",
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,

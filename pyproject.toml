@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "SIRIUS-style intervention-weighted dataset and training for LeRobot"
 requires-python = ">=3.10"
 dependencies = [
-    "lerobot>0.5.2",
+    # 0.6.0 is a hard floor, not a preference: lerobot_sirius_train imports lerobot.jobs,
+    # lerobot.configs.JobConfig and lerobot.utils.collate, and reads cfg.dataset.eval_split --
+    # none of which exist in 0.5.x. (">0.5.2" would have admitted 0.5.3 and failed at import.)
+    "lerobot>=0.6.0",
 ]
 
 [project.scripts]
