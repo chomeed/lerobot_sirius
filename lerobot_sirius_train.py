@@ -739,14 +739,49 @@ def train(cfg: SiriusTrainPipelineConfig, accelerator: "Accelerator | None" = No
         if getattr(active_cfg, "push_to_hub", False):
             unwrapped_model = accelerator.unwrap_model(policy)
             if not cfg.is_reward_model_training and cfg.policy.use_peft:
-                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model, dataset_meta=dataset.meta)
+                _push_model_to_hub_safe(unwrapped_model, cfg, dataset.meta, peft_model=unwrapped_model)
             else:
-                unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)
+                _push_model_to_hub_safe(unwrapped_model, cfg, dataset.meta, state_dict=model_state_dict)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
+
+
+def _push_model_to_hub_safe(unwrapped_model, cfg, dataset_meta, **push_kwargs):
+    """SIRIUS: push the trained policy without letting model-card validation kill a finished run.
+
+    ``make_sirius_dataset`` accepts a comma-separated ``--dataset.repo_id``
+    ("demo_repo,dagger_repo,..."), but lerobot's ``generate_model_card`` feeds that
+    joined string straight into the model card's ``datasets:`` YAML field. The Hub's
+    ``validate-yaml`` endpoint then rejects it, since "a,b,c" is not a valid single
+    dataset id. We patch the policy's ``generate_model_card`` on the instance to
+    (1) pass the ids as a proper YAML list, and (2) fall back to no ``datasets:``
+    metadata if the Hub still rejects them (e.g. private/unpublished datasets), so
+    the weights still upload. ``cfg`` is left untouched, so the saved train config
+    keeps the original comma-separated ``dataset.repo_id``.
+    """
+    orig_generate = unwrapped_model.generate_model_card
+
+    def _patched_generate(dataset_repo_id, *args, **kwargs):
+        ids = [r.strip() for r in str(dataset_repo_id).split(",") if r.strip()]
+        try:
+            return orig_generate(ids if len(ids) > 1 else dataset_repo_id, *args, **kwargs)
+        except ValueError as exc:
+            logging.warning(
+                "Model-card validation failed for datasets=%s (%s); "
+                "pushing without datasets metadata.",
+                ids,
+                exc,
+            )
+            return orig_generate(None, *args, **kwargs)
+
+    unwrapped_model.generate_model_card = _patched_generate
+    try:
+        unwrapped_model.push_model_to_hub(cfg, dataset_meta=dataset_meta, **push_kwargs)
+    finally:
+        unwrapped_model.generate_model_card = orig_generate
 
 
 def _remote_target_in_argv() -> bool:
