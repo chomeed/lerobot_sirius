@@ -11,6 +11,8 @@
 #   =true pools quantiles over all datasets (fresh lineage only, never a warm start).
 # - --sirius.demo_only_steps runs an accumulative DAgger curriculum in one job:
 #   demos alone, then +dagger_1, then +dagger_2, each round to its own output dir.
+#   --sirius.warmstart_curriculum runs the dagger rounds only (no demo round 0) from
+#   an already demo-trained checkpoint -- same rounds, warm-started instead of from base.
 # - The EpisodeAwareSampler is replaced by the SIRIUS WeightedRandomSampler,
 #   which draws frames per class with probability P*(demo/intv/preintv/robot).
 #
@@ -168,6 +170,60 @@ def build_phase_schedule(
     base = Path(cfg.output_dir)
     n_daggers = len(dataset.dagger_dataset_indices)
     warmup = cfg.sirius.demo_only_steps
+
+    # Warm-start curriculum: the dagger rounds (1..n) only, no demo round 0. The demo training is
+    # already in the warm-start checkpoint, so unlike the from-base curriculum this both skips
+    # round 0 and *expects* a task-trained checkpoint. Rounds 1..n accumulate daggers exactly as
+    # above and each writes to its own directory.
+    if cfg.sirius.warmstart_curriculum:
+        if warmup != 0:
+            raise ValueError(
+                "sirius.warmstart_curriculum runs the dagger rounds only (round 0's demo training "
+                f"is already in the warm-start checkpoint), so it conflicts with demo_only_steps="
+                f"{warmup}. Set --sirius.demo_only_steps=0, or drop warmstart_curriculum to run the "
+                "from-base curriculum with a demo round 0."
+            )
+        if n_daggers == 0:
+            raise ValueError(
+                "sirius.warmstart_curriculum needs at least one dagger dataset; pass "
+                "--dataset.repo_id=demo,dagger_1[,dagger_2...]."
+            )
+        pretrained = getattr(cfg.policy, "pretrained_path", None)
+        if _is_task_trained_checkpoint(pretrained) is False:
+            logging.warning(
+                f"sirius.warmstart_curriculum skips the demo round, but '{pretrained}' looks like a "
+                "foundation checkpoint (no train_config.json) -- the rounds would then refine a "
+                "policy that never learned the demos. Pass an already demo-trained checkpoint, or "
+                "use --sirius.demo_only_steps>0 from a base model to include a demo round."
+            )
+        per_round = cfg.sirius.dagger_round_steps
+        if per_round is None:
+            if cfg.steps <= 0 or cfg.steps % n_daggers != 0:
+                raise ValueError(
+                    f"cannot split --steps={cfg.steps} evenly across {n_daggers} dagger round(s). "
+                    f"Set --sirius.dagger_round_steps explicitly, or pick --steps as a positive "
+                    f"multiple of {n_daggers}."
+                )
+            per_round = cfg.steps // n_daggers
+        total = per_round * n_daggers
+        if total != cfg.steps:
+            raise ValueError(
+                f"warm-start curriculum requires steps == dagger_round_steps * n_daggers = "
+                f"{per_round}*{n_daggers} = {total}, but --steps={cfg.steps}."
+            )
+        repo = cfg.policy.repo_id
+        phases = []
+        start = 0
+        for k in range(1, n_daggers + 1):
+            phases.append((
+                start,
+                start + per_round,
+                k,
+                base.parent / f"{base.name}_sirius_round{k}",
+                f"{repo}_sirius_round{k}" if repo else None,
+            ))
+            start += per_round
+        return phases
 
     if warmup == 0:
         return [(0, cfg.steps, None, base, cfg.policy.repo_id)]

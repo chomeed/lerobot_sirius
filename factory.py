@@ -56,6 +56,17 @@ class SiriusConfig:
     # Steps per dagger round. None -> split the steps remaining after demo_only_steps evenly
     # across the dagger datasets.
     dagger_round_steps: int | None = None
+    # Warm-start variant of the curriculum: run the dagger rounds only (round 1..n), skipping the
+    # demo round 0, because round 0's demo training is already baked into the warm-start checkpoint.
+    # Start from an already demo-trained checkpoint (e.g. chomeed/board_insertion_pi05), keep
+    # demo_only_steps=0, and pass --dataset.repo_id=demo,dagger_1[,dagger_2...]:
+    #
+    #   round 1: demo + dagger_1             dagger_round_steps -> <output_dir>_sirius_round1
+    #   round 2: demo + dagger_1 + dagger_2  dagger_round_steps -> <output_dir>_sirius_round2
+    #
+    # This is the one-job equivalent of running the dagger rounds as sequential warm-started jobs.
+    # Incompatible with demo_only_steps>0 (that is the from-base curriculum, which includes round 0).
+    warmstart_curriculum: bool = False
     # True (default): each round restarts warmup -> cosine decay over its own steps, so every round
     # is a real training run -- which is what you'd get by running the rounds as separate jobs, and
     # what each round's pushed checkpoint implies. A single schedule spanning all rounds would give

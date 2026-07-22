@@ -264,6 +264,74 @@ round 2). Those are the autonomous-rollout frames the policy was already failing
 `--sirius.p_robot_max` caps them at 10% and hands the surplus to the demos instead — which is why
 round 2 keeps `demo=40%` rather than collapsing to 26%.
 
+### Warm-start dagger rounds with LoRA (2 GPU)
+
+`--sirius.warmstart_curriculum=true` runs the **dagger rounds only** — round 1, then
+round 2 — in one job, **skipping the demo round 0**, because the demo training is
+already baked into the warm-start checkpoint (`chomeed/board_insertion_pi05`). It's the
+one-job equivalent of running the dagger rounds as sequential warm-started jobs.
+
+| round | trains on | steps | checkpoints in |
+|---|---|---:|---|
+| 1 | demos + dagger | 25k | `..._pi05_lora_sirius_round1` |
+| 2 | demos + dagger + dagger_round2 | 25k | `..._pi05_lora_sirius_round2` |
+
+This is distinct from the two other modes: `demo_only_steps>0` from `pi05_base` (the
+*from-base* curriculum, which includes a demo round 0), and `demo_only_steps=0` with
+no `warmstart_curriculum` (a single undivided phase over all datasets). Keep
+`use_recomputed_stats=false` (the default) so normalization stays frozen to the demo
+dataset the checkpoint was trained with, identical across both rounds.
+
+LoRA adapts the frozen VLM backbone (`language_model` attention + MLP) while the
+action expert (`gemma_expert`) and the state/action projections are **fully** trained
+via `--peft.full_training_modules` (PEFT's `modules_to_save`). `p_robot_max` /
+`preintv_seconds` keep their `0.10` / `3.0` defaults, so round 2's mix settles at
+`demo 0.40 / intv 0.50 / robot 0.10` (round 1 has fewer non-demo frames, so robot rides
+below the cap). With `per_round_lr_schedule=true` (default) each round restarts its own
+warmup → cosine decay over its 25k steps.
+
+```bash
+accelerate launch --num_processes=2 --multi_gpu $(which lerobot-sirius-train) \
+    --policy.type=pi05 \
+    --policy.repo_id=chomeed/board_insertion_ablation_sirius_pi05_lora \
+    --policy.dtype=bfloat16 \
+    --policy.n_action_steps=30 \
+    --policy.chunk_size=30 \
+    --policy.pretrained_path=chomeed/board_insertion_pi05 \
+    --policy.gradient_checkpointing=true \
+    --policy.use_relative_actions=true \
+    --policy.relative_exclude_joints='["gripper_left"]' \
+    --peft.method_type=LORA \
+    --peft.r=16 \
+    "--peft.target_modules=.*\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)" \
+    "--peft.full_training_modules=[\"gemma_expert\", \"state_proj\", \"action_in_proj\", \"action_out_proj\", \"action_time_mlp_in\", \"action_time_mlp_out\"]" \
+    --dataset.repo_id="chomeed/board_insertion_ablation_head_fixed_quantile_k30_relative_action,chomeed/board_insertion_ablation_dagger,chomeed/board_insertion_ablation_dagger_round2" \
+    --sirius.p_intv=0.5 \
+    --sirius.warmstart_curriculum=true \
+    --sirius.dagger_round_steps=25_000 \
+    --output_dir=outputs/train/board_insertion_pi05_lora \
+    --job_name=board_insertion_pi05_lora_sirius \
+    --wandb.enable=true \
+    --wandb.disable_artifact=true \
+    --wandb.project=grant-hyundai \
+    --steps=50_000 \
+    --batch_size=32 \
+    --num_workers=16 \
+    --save_freq=5_000 \
+    --log_freq=200 \
+    --policy.scheduler_warmup_steps=1_000 \
+    --policy.scheduler_decay_steps=50_000 \
+    --policy.scheduler_decay_lr=1.0e-6 \
+    --optimizer.lr=1.0e-5
+```
+
+`--output_dir=..._pi05_lora` names the lineage (the warm-start checkpoint is its
+conceptual round 0); each round writes to a `_sirius_round{k}` sibling. `dagger_round_steps`
+is explicit here, but could be omitted since `--steps=50_000` splits evenly across the two
+rounds. Each round's checkpoint is a LoRA adapter; reload one with `--policy.use_peft=true`
+(the adapter config carries its `board_insertion_pi05` parent), or merge it for deployment
+with PEFT's `merge_and_unload`.
+
 ## SIRIUS options
 
 | flag | default | meaning |
@@ -274,8 +342,9 @@ round 2 keeps `demo=40%` rather than collapsing to 26%.
 | `--sirius.p_robot_max` | `0.10` | hard cap on `P*(robot)`; the surplus goes to demos |
 | `--sirius.preintv_seconds` | `3.0` | window before each intervention onset labeled `preintv` (x fps frames) |
 | `--sirius.use_recomputed_stats` | `false` | `false`: freeze normalization to the demo dataset. `true`: pool quantiles over all datasets at load time (fresh lineage only — never with a warm start) |
-| `--sirius.demo_only_steps` | `0` | steps of the demo-only warmup round. `0` disables the curriculum |
+| `--sirius.demo_only_steps` | `0` | steps of the demo-only warmup round (from-base curriculum). `0` disables it |
 | `--sirius.dagger_round_steps` | `None` | steps per dagger round. `None` splits the steps after the warmup evenly across the dagger datasets |
+| `--sirius.warmstart_curriculum` | `false` | run the dagger rounds only (no demo round 0) from an already demo-trained checkpoint; requires `demo_only_steps=0` |
 
 `P*(robot) = 1 - p_intv - p_demo - p_preintv`.
 
