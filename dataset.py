@@ -78,6 +78,17 @@ logger = logging.getLogger(__name__)
 SIRIUS_CLASSES = ("demo", "intv", "preintv", "robot")
 
 
+def parse_episode_ranges(spec: str | None) -> set[int]:
+    """"63-122,130" -> {63, ..., 122, 130}; None/"" -> empty set."""
+    out: set[int] = set()
+    for part in (spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
 class SIRIUSDataset(MultiLeRobotDataset):
     """MultiLeRobotDataset with SIRIUS-style per-class weighted sampling.
 
@@ -98,9 +109,13 @@ class SIRIUSDataset(MultiLeRobotDataset):
         p_preintv: float = 0.0,
         preintv_seconds: float = 3.0,
         p_robot_max: float = 0.10,
+        demo_upweight_episodes: str | None = None,
+        demo_upweight: float = 1.0,
         use_recomputed_stats: bool = False,
+        stats_relative_action: bool = True,
         stats_chunk_size: int = 30,
         stats_relative_exclude_joints: list[str] | None = None,
+        revision: str | None = None,
         roots: dict[str, str | Path] | None = None,
         root: str | Path | None = None,
         episodes: dict | None = None,
@@ -110,7 +125,7 @@ class SIRIUSDataset(MultiLeRobotDataset):
         download_videos: bool = True,
         video_backend: str | None = None,
     ):
-        # Replicates MultiLeRobotDataset.__init__ (lerobot 0.6.1) but resolves a
+        # Replicates MultiLeRobotDataset.__init__ (lerobot 0.6.2) but resolves a
         # per-dataset root, so hub-cached and local-path datasets can be mixed.
         torch.utils.data.Dataset.__init__(self)
         self.repo_ids = repo_ids
@@ -125,6 +140,7 @@ class SIRIUSDataset(MultiLeRobotDataset):
             LeRobotDataset(
                 repo_id,
                 root=self.roots[repo_id],
+                revision=revision,
                 episodes=episodes[repo_id] if episodes else None,
                 image_transforms=image_transforms,
                 delta_timestamps=delta_timestamps,
@@ -165,11 +181,11 @@ class SIRIUSDataset(MultiLeRobotDataset):
         # Every rank computes this identically from raw data (~10s), so no stats.json is
         # written and no rank-0 barrier is needed.
         if stats_relative_exclude_joints is None:
-            stats_relative_exclude_joints = ["gripper_left"]
+            stats_relative_exclude_joints = ["gripper"]
         if use_recomputed_stats:
             self.stats = compute_pooled_stats(
                 self._datasets,
-                relative_action=True,
+                relative_action=stats_relative_action,
                 relative_exclude_joints=stats_relative_exclude_joints,
                 chunk_size=stats_chunk_size,
             )
@@ -181,6 +197,8 @@ class SIRIUSDataset(MultiLeRobotDataset):
             # what make_sirius_dataset() actually normalizes with (it exposes the demo
             # dataset's meta as `dataset.meta` and leaves its stats untouched in this branch).
             demos = [d for d in self._datasets if "intervention" not in d.features]
+            if not demos and len(self._datasets) == 1 and "is_dagger" in self._datasets[0].features:
+                demos = self._datasets  # one merged dataset: its own stats cover its demos and dagger rounds
             if len(demos) != 1:
                 raise ValueError(
                     f"use_recomputed_stats=False freezes normalization to *the* demo dataset, but "
@@ -198,6 +216,10 @@ class SIRIUSDataset(MultiLeRobotDataset):
         fps_per_dataset = {repo_id: ds.fps for repo_id, ds in zip(self.repo_ids, self._datasets, strict=True)}
         assert len(set(fps_per_dataset.values())) == 1, f"all datasets must share the same fps, got {fps_per_dataset}"
         self._p_robot_max = p_robot_max
+        self._demo_upweight_episodes = parse_episode_ranges(demo_upweight_episodes)
+        self._demo_upweight = float(demo_upweight)
+        if self._demo_upweight <= 0:
+            raise ValueError(f"demo_upweight must be > 0, got {demo_upweight}")
         self.preintv_horizon = round(preintv_seconds * self._datasets[0].fps)
         self._label_frames()
         self._compute_sampling_probs(p_intv=p_intv, p_demo=p_demo, p_preintv=p_preintv)
@@ -212,23 +234,34 @@ class SIRIUSDataset(MultiLeRobotDataset):
         each False->True onset, robot for everything else.
         """
         labels = []
+        episodes = []  # per frame: its dataset's episode_index (for demo_upweight_episodes)
         owner = []  # index into self._datasets, per frame -- lets a curriculum phase select
         # "demos + the first k dagger datasets" without reloading anything.
         for ds_idx, ds in enumerate(self._datasets):
             n = ds.num_frames
             owner.append(np.full(n, ds_idx, dtype=np.int64))
+            episodes.append(np.asarray(ds.hf_dataset.select_columns(["episode_index"]).with_format(None)["episode_index"],
+                                       dtype=np.int64).reshape(-1))
             if "intervention" not in ds.features:
                 labels.append(np.full(n, SIRIUS_CLASSES.index("demo"), dtype=np.int64))
                 continue
 
-            cols = ds.hf_dataset.select_columns(["episode_index", "intervention"]).with_format(None)
-            ep = np.asarray(cols["episode_index"], dtype=np.int64)
-            intv = np.asarray(cols["intervention"]).astype(bool)
+            # A merged dataset (demos + dagger rounds in one repo) marks its demonstration frames with
+            # is_dagger=False; their `intervention` flag is True throughout, so it must not label them.
+            merged = "is_dagger" in ds.features
+            cols = ds.hf_dataset.select_columns(
+                ["episode_index", "intervention"] + (["is_dagger"] if merged else [])
+            ).with_format(None)
+            ep = np.asarray(cols["episode_index"], dtype=np.int64).reshape(-1)
+            dagger = np.asarray(cols["is_dagger"]).astype(bool).reshape(-1) if merged else np.ones(n, dtype=bool)
+            intv = np.asarray(cols["intervention"]).astype(bool).reshape(-1) & dagger
+            assert len(ep) == len(intv) == len(dagger) == n, (len(ep), len(intv), len(dagger), n)
 
             ds_labels = np.full(n, SIRIUS_CLASSES.index("robot"), dtype=np.int64)
             ds_labels[intv] = SIRIUS_CLASSES.index("intv")
+            ds_labels[~dagger] = SIRIUS_CLASSES.index("demo")
 
-            # onset = False->True transition within the same episode
+            # onset = False->True transition within the same (dagger) episode
             prev_intv = np.concatenate(([False], intv[:-1]))
             same_ep = np.concatenate(([False], ep[1:] == ep[:-1]))
             onsets = np.flatnonzero(intv & ~(prev_intv & same_ep))
@@ -238,12 +271,21 @@ class SIRIUSDataset(MultiLeRobotDataset):
                 while lo < 0 or ep[lo] != ep[s]:
                     lo += 1
                 window = np.arange(lo, s)
-                window = window[~intv[window]]
+                window = window[~intv[window] & dagger[window]]
                 ds_labels[window] = SIRIUS_CLASSES.index("preintv")
             labels.append(ds_labels)
 
         self.frame_labels = np.concatenate(labels)
         self.frame_dataset_idx = np.concatenate(owner)
+        self.frame_episode = np.concatenate(episodes)
+        # Within-class multiplier: demo frames of the listed episodes are drawn demo_upweight times as often as the
+        # other demo frames. Class ratios are unchanged (the demo class still sums to P*(demo)).
+        self.frame_multiplier = np.ones(len(self.frame_labels), dtype=np.float64)
+        if self._demo_upweight_episodes:
+            up = (self.frame_labels == SIRIUS_CLASSES.index("demo")) & np.isin(self.frame_episode, sorted(self._demo_upweight_episodes))
+            if not up.any():
+                raise ValueError(f"demo_upweight_episodes {sorted(self._demo_upweight_episodes)[:5]}... match no demo frame")
+            self.frame_multiplier[up] = self._demo_upweight
         self.class_indices = {
             c: np.flatnonzero(self.frame_labels == i) for i, c in enumerate(SIRIUS_CLASSES)
         }
@@ -307,8 +349,18 @@ class SIRIUSDataset(MultiLeRobotDataset):
         weights = np.zeros(n_total, dtype=np.float64)
         for i, c in enumerate(SIRIUS_CLASSES):
             if self.class_counts[c] > 0:
-                weights[self.frame_labels == i] = self.sampling_probs[c] / self.class_counts[c]
+                sel = self.frame_labels == i
+                m = self.frame_multiplier[sel]
+                weights[sel] = self.sampling_probs[c] * m / m.sum()
         self.frame_weights = torch.from_numpy(weights)
+        if self._demo_upweight_episodes:
+            demo = self.frame_labels == SIRIUS_CLASSES.index("demo")
+            up = demo & (self.frame_multiplier != 1.0)
+            logger.info(
+                f"demo_upweight x{self._demo_upweight} on {len(self._demo_upweight_episodes)} episodes: they hold "
+                f"{up.sum() / demo.sum():.1%} of demo frames and get {weights[up].sum() / weights[demo].sum():.1%} of demo samples "
+                f"({weights[up].sum():.1%} of all samples)"
+            )
 
         # docstring convention: w(c) = P*(c) / P(c)
         self.class_weights = {
@@ -353,7 +405,9 @@ class SIRIUSDataset(MultiLeRobotDataset):
                         f"phase n_daggers={n_daggers}: sampling prob for '{c}' is {probs[c]:.4f} "
                         f"but no active frame has that class"
                     )
-                weights[(self.frame_labels == i) & active] = probs[c] / counts[c]
+                sel = (self.frame_labels == i) & active
+                m = self.frame_multiplier[sel]
+                weights[sel] = probs[c] * m / m.sum()
 
         logger.info(
             f"curriculum phase n_daggers={n_daggers}: {n_active} active frames, "

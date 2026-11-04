@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "SIRIUS-style intervention-weighted dataset and training for LeRobot"
 requires-python = ">=3.10"
 dependencies = [
-    # 0.6.0 is a hard floor, not a preference: lerobot_sirius_train imports lerobot.jobs,
-    # lerobot.configs.JobConfig and lerobot.utils.collate, and reads cfg.dataset.eval_split --
-    # none of which exist in 0.5.x. (">0.5.2" would have admitted 0.5.3 and failed at import.)
-    "lerobot>=0.6.0",
+    # 0.6.2 is a hard floor: lerobot_sirius_train uses lerobot.distributed.make_accelerator and
+    # common.train_utils.resume_before_prepare/publish_trained_model, which replaced the APIs the
+    # 0.6.1 fork used (load_training_state, gather_fsdp_state_dicts, ...).
+    "lerobot>=0.6.2",
 ]
 
 [project.scripts]

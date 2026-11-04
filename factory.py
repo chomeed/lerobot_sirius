@@ -82,6 +82,10 @@ class SiriusConfig:
     # True: pool quantiles over all datasets from raw data. Correct for a *fresh* lineage
     # (training from base weights on the merged data), wrong for a warm start.
     use_recomputed_stats: bool = False
+    # Within the demo class, draw the frames of these episodes (e.g. "63-122", episode_index of the dataset) demo_upweight
+    # times as often as the other demos. The class ratios above are unchanged. Default: off.
+    demo_upweight_episodes: str | None = None
+    demo_upweight: float = 1.0
 
 
 @dataclass
@@ -148,10 +152,14 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
     demo data's stats.
     """
     repo_ids, roots = parse_repo_id_entries(cfg.dataset.repo_id)
-    if len(repo_ids) < 2:
+    root = Path(cfg.dataset.root) if cfg.dataset.root else None
+    first_root = roots.get(repo_ids[0], root / repo_ids[0] if root else None)
+    ds_meta = LeRobotDatasetMetadata(repo_ids[0], root=first_root, revision=cfg.dataset.revision)
+    # One merged dataset is enough when it marks its demonstrations with is_dagger=False.
+    if len(repo_ids) < 2 and "is_dagger" not in ds_meta.features:
         raise ValueError(
             "SIRIUS training expects at least two datasets in --dataset.repo_id "
-            f"(comma-separated: demo,dagger), got {repo_ids}"
+            f"(comma-separated: demo,dagger), or one merged dataset with an is_dagger feature; got {repo_ids}"
         )
     if cfg.dataset.streaming:
         raise NotImplementedError("SIRIUSDataset does not support streaming datasets.")
@@ -163,13 +171,9 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
     )
 
     # With multiple repos, cfg.dataset.root is a BASE directory holding one
-    # <repo_id> subdirectory per dataset; per-entry "@/path" roots override it.
-    root = Path(cfg.dataset.root) if cfg.dataset.root else None
-
+    # <repo_id> subdirectory per dataset; per-entry "@/path" roots override it (resolved above).
     # delta_timestamps resolved from the first repo's metadata; all repos must share
     # fps (asserted in SIRIUSDataset) and the policy only uses common features.
-    first_root = roots.get(repo_ids[0], root / repo_ids[0] if root else None)
-    ds_meta = LeRobotDatasetMetadata(repo_ids[0], root=first_root, revision=cfg.dataset.revision)
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
 
     sirius_cfg = getattr(cfg, "sirius", None) or SiriusConfig()
@@ -180,7 +184,14 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
         p_preintv=sirius_cfg.p_preintv,
         preintv_seconds=sirius_cfg.preintv_seconds,
         p_robot_max=sirius_cfg.p_robot_max,
+        demo_upweight_episodes=sirius_cfg.demo_upweight_episodes,
+        demo_upweight=sirius_cfg.demo_upweight,
         use_recomputed_stats=sirius_cfg.use_recomputed_stats,
+        # With use_recomputed_stats these must describe what the policy is normalized against.
+        stats_relative_action=getattr(cfg.policy, "use_relative_actions", False),
+        stats_chunk_size=getattr(cfg.policy, "chunk_size", 30),
+        stats_relative_exclude_joints=getattr(cfg.policy, "relative_exclude_joints", None),
+        revision=cfg.dataset.revision,
         roots=roots,
         root=root,
         delta_timestamps=delta_timestamps,
@@ -192,6 +203,8 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
     # Expose the demo dataset's metadata as `dataset.meta` for downstream code
     # (make_policy, processors).
     demo_datasets = [d for d in dataset._datasets if "intervention" not in d.features]
+    if not demo_datasets:  # merged dataset: its own stats cover the demos it contains
+        demo_datasets = [d for d in dataset._datasets if "is_dagger" in d.features]
     if not demo_datasets:
         raise ValueError(f"None of {repo_ids} is a demo dataset (all have an 'intervention' feature).")
     dataset.meta = demo_datasets[0].meta
