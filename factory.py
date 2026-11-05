@@ -86,6 +86,10 @@ class SiriusConfig:
     # times as often as the other demos. The class ratios above are unchanged. Default: off.
     demo_upweight_episodes: str | None = None
     demo_upweight: float = 1.0
+    # Per-frame sampling multipliers: a .npy with one positive value per frame (global index order over --dataset.repo_id),
+    # applied within each class on top of demo_upweight, so the class ratios above are unchanged. E.g. the subtask-boundary
+    # emphasis written by hyundai_duet/subtask/make_early_boundary_root.py. Default: off.
+    frame_weight_file: str | None = None
 
 
 @dataclass
@@ -186,6 +190,7 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
         p_robot_max=sirius_cfg.p_robot_max,
         demo_upweight_episodes=sirius_cfg.demo_upweight_episodes,
         demo_upweight=sirius_cfg.demo_upweight,
+        frame_weight_file=sirius_cfg.frame_weight_file,
         use_recomputed_stats=sirius_cfg.use_recomputed_stats,
         # With use_recomputed_stats these must describe what the policy is normalized against.
         stats_relative_action=getattr(cfg.policy, "use_relative_actions", False),

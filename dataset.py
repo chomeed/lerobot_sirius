@@ -111,6 +111,7 @@ class SIRIUSDataset(MultiLeRobotDataset):
         p_robot_max: float = 0.10,
         demo_upweight_episodes: str | None = None,
         demo_upweight: float = 1.0,
+        frame_weight_file: str | None = None,
         use_recomputed_stats: bool = False,
         stats_relative_action: bool = True,
         stats_chunk_size: int = 30,
@@ -220,6 +221,7 @@ class SIRIUSDataset(MultiLeRobotDataset):
         self._demo_upweight = float(demo_upweight)
         if self._demo_upweight <= 0:
             raise ValueError(f"demo_upweight must be > 0, got {demo_upweight}")
+        self._frame_weight_file = frame_weight_file
         self.preintv_horizon = round(preintv_seconds * self._datasets[0].fps)
         self._label_frames()
         self._compute_sampling_probs(p_intv=p_intv, p_demo=p_demo, p_preintv=p_preintv)
@@ -286,6 +288,15 @@ class SIRIUSDataset(MultiLeRobotDataset):
             if not up.any():
                 raise ValueError(f"demo_upweight_episodes {sorted(self._demo_upweight_episodes)[:5]}... match no demo frame")
             self.frame_multiplier[up] = self._demo_upweight
+        # Per-frame multipliers from a file (e.g. subtask-boundary emphasis), within each class like demo_upweight.
+        self._frame_weight_input = None
+        if self._frame_weight_file:
+            fw = np.load(self._frame_weight_file).astype(np.float64).reshape(-1)
+            if len(fw) != len(self.frame_labels) or not np.isfinite(fw).all() or (fw <= 0).any():
+                raise ValueError(f"frame_weight_file {self._frame_weight_file}: need {len(self.frame_labels)} finite positive "
+                                 f"values, got {len(fw)} (min {fw.min() if len(fw) else 'n/a'})")
+            self._frame_weight_input = fw
+            self.frame_multiplier = self.frame_multiplier * fw
         self.class_indices = {
             c: np.flatnonzero(self.frame_labels == i) for i, c in enumerate(SIRIUS_CLASSES)
         }
@@ -360,6 +371,14 @@ class SIRIUSDataset(MultiLeRobotDataset):
                 f"demo_upweight x{self._demo_upweight} on {len(self._demo_upweight_episodes)} episodes: they hold "
                 f"{up.sum() / demo.sum():.1%} of demo frames and get {weights[up].sum() / weights[demo].sum():.1%} of demo samples "
                 f"({weights[up].sum():.1%} of all samples)"
+            )
+
+        if self._frame_weight_input is not None:
+            up = self._frame_weight_input != 1.0
+            logger.info(
+                f"frame_weight_file {self._frame_weight_file}: {up.mean():.1%} of frames have a multiplier != 1 "
+                f"(mean x{self._frame_weight_input[up].mean() if up.any() else 1:.2f}) and get {weights[up].sum():.1%} of samples; "
+                "class ratios unchanged"
             )
 
         # docstring convention: w(c) = P*(c) / P(c)
