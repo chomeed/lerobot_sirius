@@ -268,6 +268,15 @@ class SIRIUSDataset(MultiLeRobotDataset):
             weights[sel] = shares[g] * w / w.sum()
         self.frame_groups, self.group_shares = groups, shares
         self.frame_weights = torch.from_numpy(weights)
+        # the class rates logged before (and kept for __repr__ / the model card) were over all frames; replace them with
+        # the rates this sampler actually draws, over the whole dataset
+        n = len(self.frame_labels)
+        self.sampling_probs = {c: float(weights[self.frame_labels == i].sum()) for i, c in enumerate(SIRIUS_CLASSES)}
+        self.class_weights = {c: (self.sampling_probs[c] / (self.class_counts[c] / n) if self.class_counts[c] else 0.0)
+                              for c in SIRIUS_CLASSES}
+        logger.info("effective class shares over all samples (group shares applied): "
+                    + ", ".join(f"{c} {self.sampling_probs[c]:.1%}" for c in SIRIUS_CLASSES)
+                    + "; the cable/GRC groups' frames are labeled demo")
         logger.info("group shares of the samples: " + ", ".join(
             f"group {g} {weights[groups == g].sum():.1%} ({int((groups == g).sum())} frames)" for g in range(n_groups)))
 
