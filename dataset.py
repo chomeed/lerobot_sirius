@@ -112,6 +112,9 @@ class SIRIUSDataset(MultiLeRobotDataset):
         demo_upweight_episodes: str | None = None,
         demo_upweight: float = 1.0,
         frame_weight_file: str | None = None,
+        group_file: str | None = None,
+        group_shares: str | None = None,
+        sirius_group: int = 0,
         use_recomputed_stats: bool = False,
         stats_relative_action: bool = True,
         stats_chunk_size: int = 30,
@@ -225,6 +228,48 @@ class SIRIUSDataset(MultiLeRobotDataset):
         self.preintv_horizon = round(preintv_seconds * self._datasets[0].fps)
         self._label_frames()
         self._compute_sampling_probs(p_intv=p_intv, p_demo=p_demo, p_preintv=p_preintv)
+        if group_file:
+            self._apply_group_shares(group_file, group_shares, sirius_group)
+
+    def _apply_group_shares(self, group_file: str, group_shares: str | None, sirius_group: int) -> None:
+        """Multi-task sampling: each group gets exactly its share of the samples. Inside group `sirius_group` the SIRIUS
+        class ratios are re-derived over that group's frames alone (so the other tasks' frames, which carry no
+        is_dagger/intervention labels and would count as demos, do not change them); inside every other group frames are
+        drawn uniformly, times the per-frame multipliers (frame_weight_file)."""
+        groups = np.load(group_file).astype(np.int64).reshape(-1)
+        if len(groups) != len(self.frame_labels):
+            raise ValueError(f"group_file {group_file}: {len(groups)} ids for {len(self.frame_labels)} frames")
+        shares = np.array([float(x) for x in (group_shares or "").split(",") if x.strip()], dtype=np.float64)
+        n_groups = int(groups.max()) + 1
+        if groups.min() < 0 or len(shares) != n_groups or (shares <= 0).any() or abs(shares.sum() - 1) > 1e-6:
+            raise ValueError(f"group_shares {group_shares!r}: need {n_groups} positive shares summing to 1")
+        weights = np.zeros(len(groups), dtype=np.float64)
+        for g in range(n_groups):
+            sel = groups == g
+            if not sel.any():
+                raise ValueError(f"group {g} has no frames")
+            if g == sirius_group:
+                labels = self.frame_labels[sel]
+                counts = {c: int((labels == i).sum()) for i, c in enumerate(SIRIUS_CLASSES)}
+                probs = self._resolve_probs(counts, int(sel.sum()))
+                w = np.zeros(int(sel.sum()), dtype=np.float64)
+                for i, c in enumerate(SIRIUS_CLASSES):
+                    m = labels == i
+                    if counts[c] > 0:
+                        mult = self.frame_multiplier[sel][m]
+                        w[m] = probs[c] * mult / mult.sum()
+                    elif probs[c] > 0:
+                        raise ValueError(f"group {g}: sampling prob for '{c}' is {probs[c]:.4f} but it has no frames")
+                logger.info(f"group {g} (SIRIUS, {int(sel.sum())} frames): class shares within the group "
+                            + ", ".join(f"{c} {probs[c]:.1%}" for c in SIRIUS_CLASSES))
+            else:
+                mult = self.frame_multiplier[sel]
+                w = mult / mult.sum()
+            weights[sel] = shares[g] * w / w.sum()
+        self.frame_groups, self.group_shares = groups, shares
+        self.frame_weights = torch.from_numpy(weights)
+        logger.info("group shares of the samples: " + ", ".join(
+            f"group {g} {weights[groups == g].sum():.1%} ({int((groups == g).sum())} frames)" for g in range(n_groups)))
 
     # ── POSTINIT ──────────────────────────────────────────────────────
 
@@ -445,7 +490,13 @@ class SIRIUSDataset(MultiLeRobotDataset):
         n_daggers=k restricts an accumulative curriculum phase to the demos plus the first k
         dagger datasets in `repo_ids` order (k=0 -> demo-only warmup).
         """
-        weights = self.frame_weights if n_daggers is None else self.phase_weights(n_daggers)
+        if getattr(self, "frame_groups", None) is not None:
+            # group shares replace the curriculum: only the phase over every dataset is meaningful with them
+            if n_daggers not in (None, len(self.dagger_dataset_indices)):
+                raise ValueError(f"group_file sampling does not support curriculum phases (n_daggers={n_daggers})")
+            weights = self.frame_weights
+        else:
+            weights = self.frame_weights if n_daggers is None else self.phase_weights(n_daggers)
 
         return torch.utils.data.WeightedRandomSampler(
             weights,

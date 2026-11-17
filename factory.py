@@ -90,6 +90,13 @@ class SiriusConfig:
     # applied within each class on top of demo_upweight, so the class ratios above are unchanged. E.g. the subtask-boundary
     # emphasis written by hyundai_duet/subtask/make_early_boundary_root.py. Default: off.
     frame_weight_file: str | None = None
+    # Multi-task sampling: a .npy with one group id (0..G-1) per frame (global index order) and G shares summing to 1
+    # ("0.4,0.3,0.2,0.1"). Group `sirius_group` is sampled with the SIRIUS class ratios above computed over its own
+    # frames only; every other group uniformly (times frame_weight_file). Each group gets exactly its share of samples.
+    # Default: off (one group).
+    group_file: str | None = None
+    group_shares: str | None = None
+    sirius_group: int = 0
 
 
 @dataclass
@@ -191,6 +198,9 @@ def make_sirius_dataset(cfg: SiriusTrainPipelineConfig) -> SIRIUSDataset:
         demo_upweight_episodes=sirius_cfg.demo_upweight_episodes,
         demo_upweight=sirius_cfg.demo_upweight,
         frame_weight_file=sirius_cfg.frame_weight_file,
+        group_file=sirius_cfg.group_file,
+        group_shares=sirius_cfg.group_shares,
+        sirius_group=sirius_cfg.sirius_group,
         use_recomputed_stats=sirius_cfg.use_recomputed_stats,
         # With use_recomputed_stats these must describe what the policy is normalized against.
         stats_relative_action=getattr(cfg.policy, "use_relative_actions", False),
